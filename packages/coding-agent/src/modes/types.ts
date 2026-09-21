@@ -146,6 +146,13 @@ export interface InteractiveModeContext {
 	invalidatePendingFocus(): void;
 	/** Candidate subagent ids under a mutable-viewport line, for click-to-focus. Empty when the line has no target. */
 	resolveViewportClickCandidates(index: number): string[];
+	/** Mutable-viewport row span the input editor occupied in the latest frame,
+	 * for click-to-place-cursor. Undefined when the editor did not render. */
+	editorViewportSpan(): { start: number; end: number } | undefined;
+	/** Hold (or clear) an output-selection band over mutable-viewport rows. */
+	setViewportSelectionBand(range: { start: number; end: number } | undefined): void;
+	/** Plain text of mutable-viewport rows `[start, end)` from the last frame. */
+	viewportTextLines(start: number, end: number): string[];
 	/** Flip the pinned jump list between its collapsed few and the full list. */
 	togglePinnedHudExpanded(): void;
 	/** Rebuild the pinned jump list for a `display.pinnedAgents` change. */

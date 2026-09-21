@@ -1140,9 +1140,9 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "appearance",
 			group: "Display",
-			label: "Mouse Click-to-Focus",
+			label: "Mouse Clicks",
 			description:
-				"Capture mouse clicks in the main session so live subagent cards and HUD rows focus on click, with a hover highlight on the target. Native text selection becomes Shift+drag and wheel scroll becomes Shift+wheel while on",
+				"Capture the mouse in the main session: clicking the input bar places the cursor there, dragging in it or over transcript output selects text and copies on release, and live subagent cards and HUD rows focus on click. Terminal-native drag-selection in this pane is replaced while on — turn off to restore it",
 		},
 	},
 	"tui.tight": {

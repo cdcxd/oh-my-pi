@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added mouse selection while `tui.mouse` is enabled: a click places the caret in the input bar, and dragging in the input bar or over visible transcript output selects text and copies it on release (selections are held until the next click or edit, resolve from press/release endpoints alone on click-only transports, and subagent cards still focus on click).
+
 ## [18.2.6] - 2026-09-18
 
 ### Fixed

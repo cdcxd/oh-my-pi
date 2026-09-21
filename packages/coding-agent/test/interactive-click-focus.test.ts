@@ -1,9 +1,11 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
+import * as clipboardModule from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import { Text } from "@oh-my-pi/pi-tui/components/text";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -248,7 +250,9 @@ describe("inline click-to-focus geometry", () => {
 			const viewport = plainRows(term.getViewport());
 			const screenRow = viewport.findIndex(row => row.includes(marker));
 			expect(screenRow).toBeGreaterThanOrEqual(0);
+			// Clicks resolve on release (a drag must be able to claim a press).
 			term.sendInput(`\x1b[<0;5;${screenRow + 1}M`);
+			term.sendInput(`\x1b[<0;5;${screenRow + 1}m`);
 		};
 
 		// Collapsed by default: three rows plus the expander.
@@ -263,5 +267,131 @@ describe("inline click-to-focus geometry", () => {
 		await clickRow("show less");
 		await term.waitForRender(() => plainRows(term.getViewport()).some(row => row.includes("more — expand")));
 		expect(plainRows(term.getViewport()).some(row => row.includes("ToggleAgent3"))).toBe(false);
+	});
+
+	it("places the caret from an SGR click and selects+copies from a drag on the editor row", async () => {
+		settings.set("tui.mouse", true);
+		await mode.init({ suppressWelcomeIntro: true });
+		void mode.getUserInput();
+		await term.waitForRender();
+
+		mode.editor.insertText("hello world");
+		mode.ui.requestRender();
+		await term.waitForRender(() => plainRows(term.getViewport()).some(row => row.includes("hello world")));
+
+		// Settle on a fresh frame so the editor span matches the painted rows,
+		// then locate the draft exactly as the terminal would report clicks.
+		mode.ui.requestRender();
+		await term.waitForRender();
+		const viewport = plainRows(term.getViewport());
+		const row = viewport.findIndex(line => line.includes("hello world"));
+		expect(row).toBeGreaterThanOrEqual(0);
+		const col = viewport[row]!.indexOf("w");
+		expect(col).toBeGreaterThanOrEqual(0);
+
+		// A click resolves on release: press and release both land on the "w".
+		term.sendInput(`\x1b[<0;${col + 1};${row + 1}M`);
+		await term.waitForRender();
+		// Press alone anchors a selection and never moves the caret.
+		expect(mode.editor.getCursor()).toEqual({ line: 0, col: 11 });
+		term.sendInput(`\x1b[<0;${col + 1};${row + 1}m`);
+		await term.waitForRender();
+		expect(mode.editor.getCursor()).toEqual({ line: 0, col: 6 });
+		expect(mode.editor.hasMouseSelection()).toBe(false);
+
+		// A press-drag-release selects, leaves the caret alone, and copies.
+		const copied: string[] = [];
+		const clipboard = spyOn(clipboardModule, "copyToClipboard").mockImplementation(async text => {
+			copied.push(text);
+		});
+		try {
+			term.sendInput(`\x1b[<0;${col + 1};${row + 1}M`); // press on "w"
+			await term.waitForRender();
+			term.sendInput(`\x1b[<32;${col + 6};${row + 1}M`); // drag to end of "world"
+			await term.waitForRender();
+			expect(mode.editor.getSelectedText()).toBe("world");
+			// Selection never moved the caret.
+			expect(mode.editor.getCursor()).toEqual({ line: 0, col: 6 });
+			term.sendInput(`\x1b[<0;${col + 6};${row + 1}m`); // release
+			await term.waitForRender();
+			expect(copied).toEqual(["world"]);
+			// The selection is held after release.
+			expect(mode.editor.hasMouseSelection()).toBe(true);
+
+			// The next cursor-moving click clears it.
+			term.sendInput(`\x1b[<0;${col + 1};${row + 1}M`);
+			term.sendInput(`\x1b[<0;${col + 1};${row + 1}m`);
+			await term.waitForRender();
+			expect(mode.editor.hasMouseSelection()).toBe(false);
+
+			// A click-only transport (herdr strips motion under ?1000-only
+			// reporting) delivers a drag as press + distant release alone.
+			term.sendInput(`\x1b[<0;${col + 1};${row + 1}M`); // press on "w"
+			term.sendInput(`\x1b[<0;${col + 6};${row + 1}m`); // release after "world"
+			await term.waitForRender();
+			expect(copied).toEqual(["world", "world"]);
+			expect(mode.editor.hasMouseSelection()).toBe(true);
+			expect(mode.editor.getCursor()).toEqual({ line: 0, col: 6 });
+		} finally {
+			clipboard.mockRestore();
+		}
+
+		// A click on the status line (no editor row, no click target) must not
+		// touch the caret.
+		const statusRow = term.getViewport().length - 1;
+		term.sendInput(`\x1b[<0;3;${statusRow + 1}M`);
+		term.sendInput(`\x1b[<0;3;${statusRow + 1}m`);
+		await term.waitForRender();
+		expect(mode.editor.getCursor()).toEqual({ line: 0, col: 6 });
+	});
+
+	it("drag-selects transcript rows and copies them", async () => {
+		settings.set("tui.mouse", true);
+		await mode.init({ suppressWelcomeIntro: true });
+		void mode.getUserInput();
+		await term.waitForRender();
+
+		// Transcript content to select: a plain text block.
+		mode.present([
+			new Text("first output line", 1, 0),
+			new Text("second output line", 1, 0),
+			new Text("third output line", 1, 0),
+		]);
+		mode.ui.requestRender();
+		await term.waitForRender(() => plainRows(term.getViewport()).some(row => row.includes("second output line")));
+		mode.ui.requestRender();
+		await term.waitForRender();
+
+		const viewport = plainRows(term.getViewport());
+		const first = viewport.findIndex(line => line.includes("first output line"));
+		const third = viewport.findIndex(line => line.includes("third output line"));
+		expect(first).toBeGreaterThanOrEqual(0);
+		expect(third).toBeGreaterThan(first);
+
+		const copied: string[] = [];
+		const clipboard = spyOn(clipboardModule, "copyToClipboard").mockImplementation(async text => {
+			copied.push(text);
+		});
+		try {
+			// Drag from the first line to the third: press, motion, release.
+			term.sendInput(`\x1b[<0;5;${first + 1}M`);
+			await term.waitForRender();
+			term.sendInput(`\x1b[<32;8;${third + 1}M`);
+			await term.waitForRender();
+			term.sendInput(`\x1b[<0;8;${third + 1}m`);
+			await term.waitForRender();
+
+			expect(copied.length).toBe(1);
+			expect(copied[0]).toContain("first output line");
+			expect(copied[0]).toContain("third output line");
+
+			// A plain click afterwards clears the band instead of copying.
+			term.sendInput(`\x1b[<0;5;${first + 1}M`);
+			term.sendInput(`\x1b[<0;5;${first + 1}m`);
+			await term.waitForRender();
+			expect(copied.length).toBe(1);
+		} finally {
+			clipboard.mockRestore();
+		}
 	});
 });

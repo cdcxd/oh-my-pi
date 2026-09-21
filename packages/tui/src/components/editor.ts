@@ -14,6 +14,7 @@ import { canonicalKeyId, getKeybindings, type KeybindingsManager } from "../keyb
 import { extractPrintableText, matchesKey, parseKey } from "../keys";
 import { KillRing } from "../kill-ring";
 import type { SymbolTheme } from "../symbols";
+import { theme } from "../theme/theme";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
 import {
 	getSegmenter,
@@ -426,6 +427,25 @@ interface WrapEntry {
 	chunks: TextChunk[] | null;
 }
 
+/** Rendered-row geometry captured by the last `render()`, for mapping mouse
+ * clicks back onto buffer positions (see {@link Editor.clickToCursor}). */
+interface EditorClickGeometry {
+	/** First rendered row of each visible layout line. Sorted ascending; a
+	 * layout line occupies every row up to the next entry (box styles emit
+	 * two rows for the IME-safe tail). */
+	readonly rowOfVisibleLine: readonly number[];
+	/** Rendered-row count through the last layout line (bottom border and
+	 * autocomplete popup rows start here and are not clickable text). */
+	readonly contentRowsEnd: number;
+	/** Column where a layout line's text starts: left side chrome plus the
+	 * prompt gutter. */
+	readonly textColStart: number;
+	/** Layout width the rows were laid out at (drives the shared wrap cache). */
+	readonly layoutWidth: number;
+	/** Scroll offset the visible slice started at. */
+	readonly scrollOffset: number;
+}
+
 export interface EditorTheme {
 	borderColor: (str: string) => string;
 	/** Stable accent for composer chrome that should not follow the mutable border state. */
@@ -554,6 +574,12 @@ export class Editor implements Component, Focusable {
 	 *  other multi-line consumers; single-line consumers are unaffected. */
 	#scrollbarVisible = false;
 
+	/** Row/scroll geometry of the last render, for click-to-cursor mapping. */
+	#lastClickGeometry: EditorClickGeometry | undefined;
+	/** Held mouse selection (anchor and head buffer positions), independent of
+	 * the caret: cleared by a cursor-moving click or any text edit, never by
+	 * pointer motion or its own release. */
+	#mouseSelection: { anchor: VimPosition; head: VimPosition } | undefined;
 	// Emacs-style kill ring
 	#killRing = new KillRing();
 	#lastAction: "kill" | "yank" | "type-word" | null = null;
@@ -672,11 +698,10 @@ export class Editor implements Component, Focusable {
 		return {
 			textPreview,
 			textLength,
-			previewTruncated: textLength > 120,
+			selection: this.#mouseSelectionRange(),
 			cursorLine: this.#state.cursorLine,
 			cursorCol: this.#state.cursorCol,
 			lineCount: lines.length,
-			selection: null,
 			placeholderActive: false,
 		};
 	}
@@ -1251,11 +1276,14 @@ export class Editor implements Component, Focusable {
 		const inlineHint = this.#getInlineHint();
 		const hintStyle = this.#theme.hintStyle ?? ((t: string) => `\x1b[2m${t}\x1b[0m`);
 
-		// Active Vim visual selection, if any. The cursor always sits inside it, so selected rows
-		// skip the normal cursor-glyph branches: the reverse-video span already marks the spot.
+		// Active selection, if any. The cursor always sits inside a Vim visual
+		// selection, so selected rows skip the normal cursor-glyph branches:
+		// the highlighted span already marks the spot.
 		const vimSelection = this.#vimSelection();
-
+		const activeSelection = vimSelection ?? this.#mouseSelectionSpan();
+		const rowOfVisibleLine: number[] = [];
 		for (let visibleIndex = 0; visibleIndex < visibleLayoutLines.length; visibleIndex++) {
+			rowOfVisibleLine.push(result.length);
 			const layoutLine = visibleLayoutLines[visibleIndex]!;
 			let displayText = layoutLine.text;
 			let displayWidth = layoutLine.width;
@@ -1320,21 +1348,29 @@ export class Editor implements Component, Focusable {
 			}
 
 			const selectionSpan =
-				vimSelection === null
+				activeSelection === null
 					? null
 					: this.#selectionSpanFor(
 							layoutLine,
-							vimSelection,
+							activeSelection,
 							layoutLines[this.#scrollOffset + visibleIndex + 1]?.logicalLine !== layoutLine.logicalLine,
 						);
 
 			if (selectionSpan !== null) {
+				// Mouse selections paint with the theme's selection fill so the
+				// input and transcript selections read as one gesture; Vim
+				// visual mode keeps its classic reverse video.
+				const highlight =
+					vimSelection !== null
+						? (text: string) => `\x1b[7m${text}\x1b[27m`
+						: (text: string) => theme.bgFill("selectedBg", text);
 				displayText = this.#renderSelectedLine(
 					displayText,
 					selectionSpan,
 					hasCursor ? layoutLine.cursorPos : undefined,
 					marker,
 					decorationContext,
+					highlight,
 				);
 				decorated = true;
 				if (selectionSpan.trailingNewline) displayWidth += 1;
@@ -1466,6 +1502,13 @@ export class Editor implements Component, Focusable {
 
 		const bottomRow = style.renderBottom(chromeCtx);
 		if (bottomRow !== undefined) result.push(bottomRow);
+		this.#lastClickGeometry = {
+			rowOfVisibleLine,
+			contentRowsEnd: result.length,
+			textColStart: borderWidth + (promptGutter?.width ?? 0),
+			layoutWidth,
+			scrollOffset: this.#scrollOffset,
+		};
 
 		// Add autocomplete list if active
 		if (this.#autocompleteState && this.#autocompleteList) {
@@ -2203,9 +2246,11 @@ export class Editor implements Component, Focusable {
 	}
 
 	/**
-	 * Reverse-video the selected span of one row while keeping the cursor marker at its exact
-	 * offset. Unselected fragments are decorated individually, the same way the cursor branch
-	 * splits `#decorate` around the cursor glyph.
+	 * Highlight the selected span of one row while keeping the cursor marker at
+	 * its exact offset. Unselected fragments are decorated individually, the
+	 * same way the cursor branch splits `#decorate` around the cursor glyph.
+	 * `highlight` styles the selected fragments (reverse video for Vim visual,
+	 * the theme selection fill for mouse selections).
 	 */
 	#renderSelectedLine(
 		text: string,
@@ -2213,6 +2258,7 @@ export class Editor implements Component, Focusable {
 		cursorPos: number | undefined,
 		marker: string,
 		context: EditorTextDecorationContext,
+		highlight: (text: string) => string,
 	): string {
 		const start = Math.max(0, Math.min(span.start, text.length));
 		const end = Math.max(start, Math.min(span.end, text.length));
@@ -2232,7 +2278,7 @@ export class Editor implements Component, Focusable {
 			const segment = text.slice(from, to);
 			out +=
 				from >= start && from < end
-					? `\x1b[7m${segment}\x1b[27m`
+					? highlight(segment)
 					: this.#decorate(segment, {
 							...context,
 							startCol: context.startCol + from,
@@ -2240,7 +2286,7 @@ export class Editor implements Component, Focusable {
 						});
 		}
 		if (marker && markerPos !== undefined && markerPos >= text.length) out += marker;
-		if (span.trailingNewline) out += "\x1b[7m \x1b[27m";
+		if (span.trailingNewline) out += highlight(" ");
 		return out;
 	}
 
@@ -2395,6 +2441,9 @@ export class Editor implements Component, Focusable {
 	}
 
 	#notifyChange(text?: string): void {
+		// Any text change invalidates a held mouse selection: its offsets no
+		// longer name what the user highlighted.
+		this.#mouseSelection = undefined;
 		this.#textRevision++;
 		this.onChange?.(text ?? this.getText());
 	}
@@ -2484,6 +2533,146 @@ export class Editor implements Component, Focusable {
 
 	getCursor(): { line: number; col: number } {
 		return { line: this.#state.cursorLine, col: this.#state.cursorCol };
+	}
+
+	/**
+	 * Place the cursor from a mouse click on the editor's rendered output.
+	 *
+	 * `row`/`col` are 0-based indices into the rows the last {@link render}
+	 * produced (`col` in absolute frame columns). Rows outside the text
+	 * content — borders, the autocomplete popup — map to no position and
+	 * return `false`; the caller then keeps whatever handling it had for
+	 * chrome clicks. A column past a row's text clamps to that row's end,
+	 * matching how an arrow key arrives there; a click inside a wide
+	 * grapheme lands before it, matching where the cursor renders.
+	 */
+	clickToCursor(row: number, col: number): boolean {
+		const position = this.#positionAt(row, col, false);
+		if (position === undefined) return false;
+		this.#state.cursorLine = position.line;
+		this.#setCursorCol(position.col);
+		this.#resetKillSequence();
+		this.#jumpMode = null;
+		this.#clampVimCursor();
+		this.clearMouseSelection();
+		return true;
+	}
+
+	/**
+	 * Anchor a mouse selection at a rendered row/column, replacing any held
+	 * selection. The cursor does not move: a selection and the caret are
+	 * independent (press-drag selects; the next cursor-moving click or text
+	 * edit clears the selection). Out-of-content rows/columns clamp to the
+	 * nearest text position so a drag that starts on chrome still selects from
+	 * the edge. Returns false only when no geometry exists yet.
+	 */
+	beginMouseSelection(row: number, col: number): boolean {
+		const position = this.#positionAt(row, col, true);
+		if (position === undefined) return false;
+		this.#mouseSelection = { anchor: position, head: position };
+		return true;
+	}
+
+	/** Move the held selection's head to a rendered row/column (clamped like
+	 * {@link beginMouseSelection}, so dragging past an edge selects to it). */
+	extendMouseSelection(row: number, col: number): boolean {
+		const selection = this.#mouseSelection;
+		if (selection === undefined) return false;
+		const position = this.#positionAt(row, col, true);
+		if (position === undefined) return false;
+		selection.head = position;
+		return true;
+	}
+
+	/** Whether a non-empty mouse selection is currently held. */
+	hasMouseSelection(): boolean {
+		return this.getSelectedText() !== undefined;
+	}
+
+	/** Selected text (end-exclusive, lines joined by `\n`), or undefined when
+	 * no selection is held. */
+	getSelectedText(): string | undefined {
+		const range = this.#mouseSelectionRange();
+		if (range === null) return undefined;
+		const parts: string[] = [];
+		for (let line = range.from.line; line <= range.to.line; line++) {
+			const text = this.#state.lines[line] ?? "";
+			const start = line === range.from.line ? range.from.col : 0;
+			const end = line === range.to.line ? Math.min(range.to.col, text.length) : text.length;
+			parts.push(text.slice(start, end));
+		}
+		return parts.join("\n");
+	}
+
+	/** Drop the held mouse selection without touching the caret. */
+	clearMouseSelection(): void {
+		this.#mouseSelection = undefined;
+	}
+
+	/**
+	 * Buffer position under a rendered row/column pair. Returns undefined for
+	 * non-text rows (borders, autocomplete popup) — or, with `clamp`, the
+	 * nearest text position. Column mapping is grapheme-aware: past the row's
+	 * text clamps to its end; inside a wide grapheme lands before it, matching
+	 * where the cursor renders.
+	 */
+	#positionAt(row: number, col: number, clamp: boolean): VimPosition | undefined {
+		const geometry = this.#lastClickGeometry;
+		const firstRow = geometry?.rowOfVisibleLine[0];
+		if (geometry === undefined || firstRow === undefined) return undefined;
+		if (clamp) {
+			row = Math.max(firstRow, Math.min(geometry.contentRowsEnd - 1, row));
+		} else if (row < firstRow || row >= geometry.contentRowsEnd) {
+			return undefined;
+		}
+		// Offsets are sorted, and a layout line may own several rendered rows
+		// (the box style's IME-safe tail), so take the last line starting at or
+		// above the row.
+		let visibleIndex = 0;
+		for (let index = geometry.rowOfVisibleLine.length - 1; index >= 0; index--) {
+			const start = geometry.rowOfVisibleLine[index];
+			if (start !== undefined && start <= row) {
+				visibleIndex = index;
+				break;
+			}
+		}
+		const layoutLine = this.#layoutText(geometry.layoutWidth)[geometry.scrollOffset + visibleIndex];
+		if (layoutLine === undefined) return undefined;
+		// Clamp into the row's displayed text: wrapped chunks trim trailing
+		// whitespace for display while their source span keeps it, so the chunk
+		// text — never the span end — bounds the reachable cursor columns.
+		const textCol = Math.max(0, col - geometry.textColStart);
+		let offset = 0;
+		let column = 0;
+		for (const { segment, index } of segmenter.segment(layoutLine.text)) {
+			const width = visibleWidth(segment);
+			if (textCol < column + width) {
+				offset = index;
+				break;
+			}
+			column += width;
+			offset = index + segment.length;
+		}
+		return { line: layoutLine.sourceLine, col: layoutLine.sourceStartCol + offset };
+	}
+
+	/** Ordered anchor→head range of the held mouse selection; null when none. */
+	#mouseSelectionRange(): { from: VimPosition; to: VimPosition } | null {
+		const selection = this.#mouseSelection;
+		if (selection === undefined) return null;
+		const { anchor, head } = selection;
+		const [from, to] =
+			anchor.line < head.line || (anchor.line === head.line && anchor.col <= head.col)
+				? [anchor, head]
+				: [head, anchor];
+		if (from.line === to.line && from.col === to.col) return null;
+		return { from, to };
+	}
+
+	/** Mouse-selection view in the shape the shared selection renderer takes. */
+	#mouseSelectionSpan(): { from: VimPosition; to: VimPosition; linewise: boolean } | null {
+		const range = this.#mouseSelectionRange();
+		return range === null ? null : { from: range.from, to: range.to, linewise: false };
 	}
 
 	moveToLineStart(): void {

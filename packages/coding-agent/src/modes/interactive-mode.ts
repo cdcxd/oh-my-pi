@@ -1048,6 +1048,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.composer.viewportClickCandidates(index);
 	}
 
+	editorViewportSpan(): { start: number; end: number } | undefined {
+		return this.composer.editorViewportSpan();
+	}
+
+	setViewportSelectionBand(range: { start: number; end: number } | undefined): void {
+		this.composer.setViewportSelectionBand(range);
+	}
+
+	viewportTextLines(start: number, end: number): string[] {
+		return this.composer.viewportTextLines(start, end);
+	}
+
 	/** Flip the pinned jump list between its collapsed few and the full list, overriding the setting. */
 	togglePinnedHudExpanded(): void {
 		const mode = settings.get("display.pinnedAgents");

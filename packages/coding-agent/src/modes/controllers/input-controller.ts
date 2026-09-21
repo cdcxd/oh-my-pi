@@ -212,6 +212,13 @@ export class InputController {
 
 	/** Click-candidate id the hover band currently tracks; repaint only on change. */
 	#lastHoverClickId: string | undefined;
+	/** Whether the in-flight left-button gesture anchored on the input editor
+	 * (press anchored a selection). Undefined outside a gesture. */
+	#editorPressOnEditor: boolean | undefined;
+	/** In-flight output (transcript) selection: press's viewport row plus
+	 * whether live drag motion arrived, and the held band in viewport rows. */
+	#outputPress: { row: number; dragged: boolean } | undefined;
+	#outputBand: { start: number; end: number } | undefined;
 
 	/** Return the last full editor snapshot delivered by its change contract. */
 	getDraftText(): string {
@@ -699,21 +706,173 @@ export class InputController {
 	}
 
 	/**
-	 * Inline click-to-focus (`tui.mouse`): left-clicks on live subagent cards
-	 * and HUD rows focus that agent in one action, and pointer motion lights up
-	 * the hover band on the target under the cursor. Every SGR report is consumed
-	 * while inline tracking owns the terminal so button/wheel bytes never reach
-	 * the editor as typed input; clicks on chrome simply swallow.
+	 * Inline mouse routing (`tui.mouse`). Gestures resolve like Claude-style
+	 * editors: a press on the editor anchors a selection (the caret never
+	 * moves for a selection); dragging extends it live where the transport
+	 * reports motion, clamped to the editor's text; release resolves the
+	 * gesture — a release at the anchor cell is a click (caret move that
+	 * clears the selection), any other release extends the selection to the
+	 * release point, copies it, and holds it, so click-only transports that
+	 * strip drag motion still select from the two endpoints alone. Releases
+	 * off-editor fall through to click-to-focus on subagent cards and HUD
+	 * rows, and pointer motion lights up the hover band on the target under
+	 * the cursor. Every SGR report is consumed while inline tracking owns the
+	 * terminal so button/wheel bytes never reach the editor as typed input;
+	 * clicks on chrome simply swallow.
 	 */
 	#handleInlineMouse(data: string): { consume?: boolean; data?: string } | undefined {
 		if (!data.startsWith("\x1b[<")) return undefined;
 		if (!settings.get("tui.mouse")) return undefined;
-		if (this.ctx.ui.hasOverlay()) return undefined;
 		const event = parseSgrMouse(data);
 		if (!event) return undefined;
-		if (event.motion) this.#updateHoverHighlight(event.row);
-		else if (event.leftClick) this.#focusClickedAgent(event.row);
+		if (this.ctx.ui.hasOverlay()) {
+			// An overlay owns the pointer; a gesture in flight must not leak
+			// into it (extending a selection across screens).
+			this.#editorPressOnEditor = undefined;
+			this.#outputPress = undefined;
+			return undefined;
+		}
+		if (event.motion) {
+			// Left-button motion while a press anchored extends the selection
+			// (editor or output band); every other motion (hover, other
+			// buttons) keeps the band semantics.
+			if ((event.button & 3) === 0 && this.#editorPressOnEditor === true) {
+				this.#extendEditorSelection(event.row, event.col);
+			} else if ((event.button & 3) === 0 && this.#outputPress !== undefined) {
+				this.#extendOutputSelection(event.row, true);
+			} else {
+				this.#updateHoverHighlight(event.row);
+			}
+		} else if (event.leftClick) {
+			// Press only anchors: the gesture resolves on release, so a drag
+			// can claim it instead of a caret move. Every press drops any held
+			// output band (a click clears selections); a press off the editor
+			// then anchors an output selection.
+			this.#editorPressOnEditor = this.#beginEditorSelection(event.row, event.col);
+			this.ctx.setViewportSelectionBand(undefined);
+			this.#outputBand = undefined;
+			this.#outputPress = this.#editorPressOnEditor ? undefined : this.#beginOutputSelection(event.row);
+		} else if (event.release && (event.button & 3) === 0) {
+			// Extend to the release point first: click-only transports (herdr
+			// strips motion under ?1000-only reporting) deliver a drag as just
+			// a press and a release at different cells, and the two endpoints
+			// alone define the selection. Where motion did arrive this is
+			// idempotent.
+			if (this.#editorPressOnEditor === true) {
+				this.#extendEditorSelection(event.row, event.col);
+			} else if (this.#outputPress !== undefined) {
+				this.#extendOutputSelection(event.row, false);
+			}
+			const selecting = this.#editorPressOnEditor === true && this.ctx.editor.hasMouseSelection();
+			const outputRange = selecting ? undefined : this.#outputSelectionRange();
+			this.#editorPressOnEditor = undefined;
+			this.#outputPress = undefined;
+			if (selecting) {
+				this.#copyEditorSelection();
+			} else if (outputRange !== undefined) {
+				this.#copyOutputSelection(outputRange);
+			} else if (!this.#moveCursorFromEditorClick(event.row, event.col)) {
+				this.#focusClickedAgent(event.row);
+			}
+		}
 		return { consume: true };
+	}
+	/** Anchor an output selection at the press's viewport row; undefined when
+	 * the viewport is not live (resize/alt-screen transactions). */
+	#beginOutputSelection(screenRow: number): { row: number; dragged: boolean } | undefined {
+		const viewport = this.ctx.ui.getMutableViewport();
+		if (viewport.length === 0) return undefined;
+		const local = screenRow - viewport.top;
+		if (local < 0 || local >= viewport.length) return undefined;
+		return { row: local, dragged: false };
+	}
+
+	/** Extend the held output band to the pointer's viewport row. `fromMotion`
+	 * marks a live drag; the release endpoint also extends (click-only
+	 * transports) but a same-row release alone never counts as a selection. */
+	#extendOutputSelection(screenRow: number, fromMotion: boolean): void {
+		const press = this.#outputPress;
+		if (press === undefined) return;
+		if (fromMotion) press.dragged = true;
+		const viewport = this.ctx.ui.getMutableViewport();
+		const local = Math.max(0, Math.min(viewport.length - 1, screenRow - viewport.top));
+		const start = Math.min(press.row, local);
+		const end = Math.max(press.row, local) + 1;
+		this.#outputBand = { start, end };
+		this.ctx.setViewportSelectionBand({ start, end });
+		this.ctx.ui.requestRender();
+	}
+
+	/** Held band as a valid selection: a real drag (motion or crossed rows),
+	 * never a plain click. */
+	#outputSelectionRange(): { start: number; end: number } | undefined {
+		const press = this.#outputPress;
+		const band = this.#outputBand;
+		if (press === undefined || band === undefined) return undefined;
+		if (!press.dragged && band.end - band.start < 2) return undefined;
+		return band;
+	}
+
+	#copyOutputSelection(range: { start: number; end: number }): void {
+		const lines = this.ctx.viewportTextLines(range.start, range.end);
+		while (lines.length > 0 && lines[0] === "") lines.shift();
+		while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+		const text = lines.join("\n");
+		if (text === "") return;
+		copyToClipboard(text).catch(error => logger.warn("Failed to copy output selection", { error: String(error) }));
+	}
+
+	/**
+	 * Editor-local row/col for a screen point, within the last frame's editor
+	 * span. The mutable viewport must be live: during resize/alt-screen
+	 * transactions the published span predates the repaint, so routing then
+	 * could misplace the caret — return undefined. With `clamp`, rows outside
+	 * the span pull to its nearest edge so a drag past the editor keeps
+	 * selecting instead of stalling.
+	 */
+	#editorLocalPoint(screenRow: number, screenCol: number, clamp: boolean): { row: number; col: number } | undefined {
+		const span = this.ctx.editorViewportSpan();
+		const viewport = this.ctx.ui.getMutableViewport();
+		if (span === undefined || viewport.length === 0) return undefined;
+		const local = screenRow - viewport.top;
+		if (clamp && (local < span.start || local >= span.end)) {
+			return { row: Math.max(span.start, Math.min(span.end - 1, local)) - span.start, col: screenCol };
+		}
+		if (local < span.start || local >= span.end) return undefined;
+		return { row: local - span.start, col: screenCol };
+	}
+
+	#beginEditorSelection(screenRow: number, screenCol: number): boolean {
+		const point = this.#editorLocalPoint(screenRow, screenCol, false);
+		if (point === undefined) return false;
+		return this.ctx.editor.beginMouseSelection(point.row, point.col);
+	}
+
+	#extendEditorSelection(screenRow: number, screenCol: number): void {
+		const point = this.#editorLocalPoint(screenRow, screenCol, true);
+		if (point === undefined) return;
+		this.ctx.editor.extendMouseSelection(point.row, point.col);
+		this.ctx.ui.requestRender();
+	}
+
+	#copyEditorSelection(): void {
+		const text = this.ctx.editor.getSelectedText();
+		if (text === undefined) return;
+		// Best-effort OSC 52 plus platform tools; a failure must not disturb
+		// the held selection.
+		copyToClipboard(text).catch(error => logger.warn("Failed to copy mouse selection", { error: String(error) }));
+	}
+
+	/**
+	 * Place the input caret from a click on the editor's rendered rows.
+	 * Returns false when the release landed off-editor so click-to-focus runs.
+	 */
+	#moveCursorFromEditorClick(screenRow: number, screenCol: number): boolean {
+		const point = this.#editorLocalPoint(screenRow, screenCol, false);
+		if (point === undefined) return false;
+		if (!this.ctx.editor.clickToCursor(point.row, point.col)) return false;
+		this.ctx.ui.requestRender();
+		return true;
 	}
 
 	/**
@@ -747,8 +906,10 @@ export class InputController {
 	 */
 	clearHoverHighlight(): void {
 		this.#lastHoverClickId = undefined;
+		this.#outputPress = undefined;
+		this.#outputBand = undefined;
+		this.ctx.setViewportSelectionBand(undefined);
 	}
-
 	#focusClickedAgent(screenRow: number): void {
 		const candidates = this.#viewportCandidates(screenRow);
 		if (candidates.length === 0) return;

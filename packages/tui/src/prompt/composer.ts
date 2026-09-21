@@ -248,6 +248,16 @@ export class Composer implements TerminalFrameProvider {
 	#lastClickSpans: ViewportClickSpan[] = [];
 	/** Click-candidate id under the pointer, painted with the hover band. Id-anchored so it follows streaming rows. */
 	#hoveredClickId: string | undefined;
+	/** Input-editor row span of the last `renderFrame`, in viewport coordinates.
+	 * The start may be negative when a shrunk terminal clipped the editor's top
+	 * rows — visible rows still map through it; rows before 0 were never painted. */
+	#editorViewportSpan: { start: number; end: number } | undefined;
+	/** Held output-selection band over mutable-viewport rows — screen-anchored
+	 * like a terminal selection: it keeps its viewport rows across repaints and
+	 * streams beneath it, until the next press clears it. */
+	#selectionBand: { start: number; end: number } | undefined;
+	/** Unbanded viewport lines of the last rendered frame, for selection copies. */
+	#lastViewportLines: readonly string[] = [];
 	// Hard-row prefix currently above the native viewport. The first resize
 	// frame may pull part of it down before the normal buffer is borrowed.
 	#retiredHeaderStart = 0;
@@ -339,13 +349,29 @@ export class Composer implements TerminalFrameProvider {
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
 			this.#lastClickSpans = [];
-			return { viewport: this.#renderRoots(roots, width).slice(-rows) };
+			const composed: string[] = [];
+			let editorSpan: { start: number; end: number } | undefined;
+			for (const root of roots) {
+				const start = composed.length;
+				const childLines = root.render(width);
+				composed.push(...childLines);
+				if (root === this.#editor && childLines.length > 0) editorSpan = { start, end: composed.length };
+			}
+			const drop = Math.max(0, composed.length - rows);
+			this.#editorViewportSpan = this.#viewportSpan(editorSpan, -drop, composed.length - drop);
+			return { viewport: composed.slice(-rows) };
 		}
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
 		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
 		const afterRoots = roots.slice(transcriptIndex + 1);
 		const after: string[] = [];
 		const afterSpans: ViewportClickSpan[] = [];
+		// Editor rows inside `after`, tracked wherever the layout keeps them
+		// addressable: as a direct root, or as a child of a plain container whose
+		// rows tile the root span exactly. A custom-render root that absorbs its
+		// children cannot be span-tracked; the span stays undefined and editor
+		// clicks fall back to the generic consume.
+		let editorSpan: { start: number; end: number } | undefined;
 		for (const root of afterRoots) {
 			const start = after.length;
 			// Row targets usually nest one level down: chrome roots are plain
@@ -365,6 +391,9 @@ export class Composer implements TerminalFrameProvider {
 				for (let index = 0; index < targets.length; index++) {
 					const childLines = targets[index]!.render(width);
 					after.push(...childLines);
+					if (targets[index] === this.#editor && childLines.length > 0) {
+						editorSpan = { start: offset, end: offset + childLines.length };
+					}
 					if (index > lastTarget) continue;
 					const resolve = resolves[index];
 					if (resolve !== undefined && childLines.length > 0) {
@@ -375,6 +404,7 @@ export class Composer implements TerminalFrameProvider {
 				continue;
 			}
 			after.push(...root.render(width));
+			if (root === this.#editor && after.length > start) editorSpan = { start, end: after.length };
 			if (lastTarget === -1) continue;
 			let offset = start;
 			for (let index = 0; index <= lastTarget; index++) {
@@ -436,11 +466,13 @@ export class Composer implements TerminalFrameProvider {
 		for (const span of activeSpans) shift(span, before.length - drop);
 		for (const span of afterSpans) shift(span, before.length + active.length - drop);
 		this.#lastClickSpans = spans;
+		this.#editorViewportSpan = this.#viewportSpan(editorSpan, before.length + active.length - drop, viewportLength);
 		if (history !== undefined && this.#offeredHistory?.source === "header") {
 			const visibleHeaderRows = Math.max(0, rows - (mutable.length + drop));
 			this.#retiredHeaderStart = Math.max(0, history.rows.length - visibleHeaderRows);
 		}
-		return { history, viewport: this.#paintHoverBand(mutable, spans) };
+		this.#lastViewportLines = mutable;
+		return { history, viewport: this.#paintSelectionBand(this.#paintHoverBand(mutable, spans)) };
 	}
 
 	/**
@@ -469,6 +501,39 @@ export class Composer implements TerminalFrameProvider {
 		return banded ? painted : viewport;
 	}
 
+	/** Band the held output-selection rows. Applied after the hover band so a
+	 * selection visually owns its rows while both are active. */
+	#paintSelectionBand(viewport: string[]): string[] {
+		const band = this.#selectionBand;
+		if (band === undefined) return viewport;
+		return viewport.map((line, index) =>
+			index >= band.start && index < band.end
+				? theme.bgFill("selectedBg", line.replace(NESTED_BG_OPEN_PATTERN, ""))
+				: line,
+		);
+	}
+
+	/**
+	 * Hold (or clear) the output-selection band over mutable-viewport rows.
+	 * Screen-anchored like a terminal selection: rows keep their viewport
+	 * positions across repaints; the next press clears it.
+	 */
+	setViewportSelectionBand(range: { start: number; end: number } | undefined): void {
+		this.#selectionBand = range;
+	}
+
+	/**
+	 * Plain text of viewport rows `[start, end)` from the last frame, stripped
+	 * of styling and right-trimmed, for selection copies. Empty outside the
+	 * painted viewport.
+	 */
+	viewportTextLines(start: number, end: number): string[] {
+		const lines = this.#lastViewportLines;
+		const from = Math.max(0, Math.min(start, lines.length));
+		const to = Math.max(from, Math.min(end, lines.length));
+		return lines.slice(from, to).map(line => Bun.stripANSI(line).trimEnd());
+	}
+
 	/**
 	 * Candidate subagent ids under a mutable-viewport line, for click-to-focus.
 	 * Empty when the line has no click target (chrome, separators, retired rows
@@ -476,6 +541,32 @@ export class Composer implements TerminalFrameProvider {
 	 */
 	viewportClickCandidates(index: number): string[] {
 		return routeViewportClick(this.#lastClickSpans, index);
+	}
+
+	/**
+	 * Input-editor row span of the last rendered frame, in mutable-viewport
+	 * coordinates (the same space {@link viewportClickCandidates} indexes).
+	 * Undefined when the editor did not render — off-screen, or inside a
+	 * custom-render root whose child rows cannot be tracked. The start may be
+	 * negative when the terminal clipped the editor's top rows; rows before 0
+	 * never painted, and clicks on the visible remainder keep mapping.
+	 */
+	editorViewportSpan(): { start: number; end: number } | undefined {
+		return this.#editorViewportSpan;
+	}
+
+	/** Shift a composed-frame span into viewport coordinates, clamping only the
+	 * painted end: keeping an unclamped start lets clicks on still-visible rows
+	 * of a partially clipped span keep their correct span-local offsets. */
+	#viewportSpan(
+		span: { start: number; end: number } | undefined,
+		base: number,
+		viewportLength: number,
+	): { start: number; end: number } | undefined {
+		if (span === undefined) return undefined;
+		const start = span.start + base;
+		const end = Math.min(span.end + base, viewportLength);
+		return end > start ? { start, end } : undefined;
 	}
 
 	/**

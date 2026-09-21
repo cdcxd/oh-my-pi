@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `Editor.clickToCursor` click-to-caret mapping (grapheme- and wrap-aware) and a `Composer.editorViewportSpan` frame-row span so hosts can route mouse clicks on the input editor; `Editor` also gained a caret-independent mouse-selection API (`beginMouseSelection`/`extendMouseSelection`/`getSelectedText`) rendered with the shared selection highlight.
+
 ## [18.2.5] - 2026-09-17
 
 ### Added
